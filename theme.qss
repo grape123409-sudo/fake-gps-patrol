@@ -1,0 +1,148 @@
+/* ==========================================
+ * 檔案名稱：theme.qss
+ * 說明：黑金主題，顏色沿用 Tkinter 版 my_fake_gps.py 的 BG_COLOR/GOLD_COLOR/BORDER_COLOR。
+ * ========================================== */
+
+* {
+    font-family: "Microsoft JhengHei", "Segoe UI";
+    color: #e0e0e0;
+}
+
+QMainWindow, QWidget {
+    background-color: #121212;
+}
+
+QWidget#Panel {
+    background-color: #1e1e1e;
+    border: 1px solid #c5a059;
+    border-radius: 6px;
+}
+
+QLabel {
+    background: transparent;
+}
+
+QLabel[role="title"] {
+    color: #ffd700;
+    font-weight: bold;
+    font-size: 13px;
+}
+
+QLabel[role="hint"] {
+    color: #999999;
+    font-size: 11px;
+}
+
+QGroupBox {
+    border: 1.5px solid #c5a059;
+    border-radius: 4px;
+    margin-top: 10px;
+    font-weight: bold;
+    color: #ffd700;
+    padding-top: 6px;
+}
+QGroupBox::title {
+    subcontrol-origin: margin;
+    left: 8px;
+    padding: 0 4px;
+}
+
+QPushButton {
+    background-color: #1e1e1e;
+    color: #ffd700;
+    border: 1px solid #c5a059;
+    border-radius: 4px;
+    padding: 6px 10px;
+    font-weight: bold;
+}
+QPushButton:hover { background-color: #2a2a1a; }
+QPushButton:pressed, QPushButton:checked { background-color: #ffd700; color: #121212; }
+QPushButton:disabled { color: #666666; border-color: #444444; }
+
+QPushButton#DangerButton { color: #ff6b6b; border-color: #a33; }
+QPushButton#DangerButton:hover { background-color: #3a1a1a; }
+QPushButton#SuccessButton { color: #2ecc71; border-color: #1e8449; }
+QPushButton#SuccessButton:hover { background-color: #1a3a1a; }
+
+QLineEdit, QTextEdit, QPlainTextEdit, QSpinBox, QDoubleSpinBox {
+    background-color: #0a0a0a;
+    color: #ffffff;
+    border: 1px solid #c5a059;
+    border-radius: 3px;
+    padding: 4px;
+    selection-background-color: #ffd700;
+    selection-color: #121212;
+}
+QLineEdit:focus, QTextEdit:focus, QDoubleSpinBox:focus { border-color: #ffd700; }
+
+QComboBox {
+    background-color: #0a0a0a;
+    color: #ffffff;
+    border: 1px solid #c5a059;
+    border-radius: 3px;
+    padding: 4px;
+}
+QComboBox QAbstractItemView {
+    background-color: #1e1e1e;
+    color: #ffffff;
+    selection-background-color: #ffd700;
+    selection-color: #121212;
+}
+
+QCheckBox, QRadioButton { spacing: 6px; }
+QCheckBox::indicator, QRadioButton::indicator { width: 14px; height: 14px; }
+
+QTabWidget::pane { border: 1px solid #c5a059; }
+QTabBar::tab {
+    background: #1e1e1e; color: #e0e0e0; padding: 6px 12px;
+    border: 1px solid #c5a059; border-bottom: none;
+}
+QTabBar::tab:selected { background: #ffd700; color: #121212; font-weight: bold; }
+
+QScrollBar:vertical { background: #121212; width: 12px; }
+QScrollBar::handle:vertical { background: #c5a059; border-radius: 5px; min-height: 20px; }
+QScrollBar:horizontal { background: #121212; height: 12px; }
+QScrollBar::handle:horizontal { background: #c5a059; border-radius: 5px; min-width: 20px; }
+
+QListWidget, QTableWidget {
+    background-color: #0a0a0a;
+    color: #e0e0e0;
+    border: 1px solid #c5a059;
+    gridline-color: #333333;
+}
+QHeaderView::section {
+    background-color: #1e1e1e; color: #ffd700; border: 1px solid #c5a059; padding: 4px;
+}
+
+QDockWidget {
+    color: #ffd700;
+    font-weight: bold;
+    titlebar-close-icon: none;
+}
+QDockWidget::title {
+    background: #1e1e1e;
+    border: 1px solid #c5a059;
+    padding: 6px;
+}
+
+QToolBar {
+    background: #1e1e1e;
+    border: 1px solid #c5a059;
+    spacing: 4px;
+}
+QToolButton {
+    background: #1e1e1e; color: #ffd700; border: 1px solid #c5a059;
+    border-radius: 4px; padding: 6px; font-size: 16px;
+}
+QToolButton:hover { background: #ffd700; color: #121212; }
+QToolButton:checked { background: #ffd700; color: #121212; }
+
+QStatusBar {
+    background: #1e1e1e; color: #ffd700; border-top: 1px solid #c5a059;
+}
+
+QSlider::groove:horizontal { background: #333333; height: 4px; border-radius: 2px; }
+QSlider::handle:horizontal { background: #ffd700; width: 14px; margin: -6px 0; border-radius: 7px; }
+
+QProgressBar { border: 1px solid #c5a059; border-radius: 3px; text-align: center; background: #0a0a0a; }
+QProgressBar::chunk { background-color: #ffd700; }

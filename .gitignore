@@ -1,0 +1,18 @@
+# 打包產物（用 build_release.bat 重新產生，不進版本控制）
+dist/
+dist_pmd3/
+build/
+build_pmd3/
+*.spec
+
+# Python 執行期快取
+__pycache__/
+*.pyc
+
+# 執行後自動產生的個人資料/快取（每個人使用起來內容都不一樣，不該共用）
+map_tile_cache.db
+user_settings.json
+favorites.json
+speed_presets.json
+saved_regions_a.json
+saved_regions_b.json
