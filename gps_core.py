@@ -25,6 +25,14 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Optional
 
+
+# iOS 模擬定位是綁在 DVT 連線上的：逐點送座標那條路徑每次都是「連線→設定→
+# 馬上斷線」，斷線後系統實測約 20 秒就會自動把定位跳回真實 GPS（跟 Xcode
+# 「Simulate Location」中斷偵錯器就會跳回真實定位是同一個機制，不是這支程式的
+# bug，是蘋果那邊 DVT session 的行為）。這裡訂一個明顯小於 20 秒的續命間隔，
+# 見 GpsEngine._ios_keepalive_loop()。
+IOS_KEEPALIVE_INTERVAL = 10.0
+
 logger = logging.getLogger("gps_core")
 if not logger.handlers:
     _handler = logging.StreamHandler()
@@ -163,6 +171,10 @@ class GpsEngine:
         self._state = ConnectionState.IDLE
         self._active_transport: Optional[Transport] = None
         self._last_error: Optional[str] = None
+
+        # ---- iOS 逐點模式的「續命」機制（見 _ios_keepalive_loop 說明）----
+        self._last_known_location: Optional[tuple[float, float]] = None
+        self._last_send_time: float = 0.0
 
     # ---------------- 事件迴圈執行緒管理 ----------------
 
@@ -345,33 +357,38 @@ class GpsEngine:
         loop = asyncio.get_running_loop()
         self._set_state(ConnectionState.CONNECTED)
         assert self._cmd_queue is not None
-        while True:
-            cmd = await self._cmd_queue.get()
-            if cmd is None:
-                break
-            # 佇列堆積時（上一個指令還沒送完，巡邏又排了新座標進來），
-            # 只送最新的一個，中間過時的座標直接丟棄，避免越堆越多、巡邏卡住不動
-            while not self._cmd_queue.empty():
-                nxt = self._cmd_queue.get_nowait()
-                if nxt is None:
-                    cmd = None
+        keepalive_task = asyncio.ensure_future(self._ios_keepalive_loop())
+        try:
+            while True:
+                cmd = await self._cmd_queue.get()
+                if cmd is None:
                     break
-                cmd = nxt
-            if cmd is None:
-                break
-            lat, lng = cmd
-            self._busy = True
-            try:
-                await loop.run_in_executor(None, self._send_location_ios_userspace_subprocess, lat, lng)
-            except Exception as e:
-                self._last_error = self._friendly_error(e)
-                logger.warning("iOS 免通道送定位失敗: %s", self._last_error)
-                # 失敗（尤其是逾時）代表裝置端的連線可能還沒完全釋放，緊接著馬上重連
-                # 很容易再次卡住撞逾時；巡邏會不斷排新座標進來，這裡刻意先讓連線緩一下，
-                # 比起立刻重試更容易恢復正常
-                await asyncio.sleep(1.5)
-            finally:
-                self._busy = False
+                # 佇列堆積時（上一個指令還沒送完，巡邏又排了新座標進來），
+                # 只送最新的一個，中間過時的座標直接丟棄，避免越堆越多、巡邏卡住不動
+                while not self._cmd_queue.empty():
+                    nxt = self._cmd_queue.get_nowait()
+                    if nxt is None:
+                        cmd = None
+                        break
+                    cmd = nxt
+                if cmd is None:
+                    break
+                lat, lng = cmd
+                self._busy = True
+                self._last_send_time = time.time()
+                try:
+                    await loop.run_in_executor(None, self._send_location_ios_userspace_subprocess, lat, lng)
+                except Exception as e:
+                    self._last_error = self._friendly_error(e)
+                    logger.warning("iOS 免通道送定位失敗: %s", self._last_error)
+                    # 失敗（尤其是逾時）代表裝置端的連線可能還沒完全釋放，緊接著馬上重連
+                    # 很容易再次卡住撞逾時；巡邏會不斷排新座標進來，這裡刻意先讓連線緩一下，
+                    # 比起立刻重試更容易恢復正常
+                    await asyncio.sleep(1.5)
+                finally:
+                    self._busy = False
+        finally:
+            keepalive_task.cancel()
 
     def _send_location_ios_userspace_subprocess(self, lat: float, lng: float) -> None:
         cmd = [
@@ -396,29 +413,34 @@ class GpsEngine:
         loop = asyncio.get_running_loop()
         self._set_state(ConnectionState.CONNECTED)
         assert self._cmd_queue is not None
-        while True:
-            cmd = await self._cmd_queue.get()
-            if cmd is None:
-                break
-            while not self._cmd_queue.empty():
-                nxt = self._cmd_queue.get_nowait()
-                if nxt is None:
-                    cmd = None
+        keepalive_task = asyncio.ensure_future(self._ios_keepalive_loop())
+        try:
+            while True:
+                cmd = await self._cmd_queue.get()
+                if cmd is None:
                     break
-                cmd = nxt
-            if cmd is None:
-                break
-            lat, lng = cmd
-            self._busy = True
-            try:
-                await loop.run_in_executor(None, self._send_location_ios_rsd, rsd_ip, rsd_port, lat, lng)
-            except Exception as e:
-                self._last_error = self._friendly_error(e)
-                logger.warning("iOS RSD 送定位失敗: %s", self._last_error)
-                # 同上：失敗後先緩一下再讓迴圈撈下一筆，避免連線還沒釋放就立刻重試又卡住
-                await asyncio.sleep(1.5)
-            finally:
-                self._busy = False
+                while not self._cmd_queue.empty():
+                    nxt = self._cmd_queue.get_nowait()
+                    if nxt is None:
+                        cmd = None
+                        break
+                    cmd = nxt
+                if cmd is None:
+                    break
+                lat, lng = cmd
+                self._busy = True
+                self._last_send_time = time.time()
+                try:
+                    await loop.run_in_executor(None, self._send_location_ios_rsd, rsd_ip, rsd_port, lat, lng)
+                except Exception as e:
+                    self._last_error = self._friendly_error(e)
+                    logger.warning("iOS RSD 送定位失敗: %s", self._last_error)
+                    # 同上：失敗後先緩一下再讓迴圈撈下一筆，避免連線還沒釋放就立刻重試又卡住
+                    await asyncio.sleep(1.5)
+                finally:
+                    self._busy = False
+        finally:
+            keepalive_task.cancel()
 
     def _send_location_ios_rsd(self, rsd_ip: Optional[str], rsd_port: Optional[str], lat: float, lng: float) -> None:
         base = [
@@ -446,10 +468,39 @@ class GpsEngine:
         if self._loop is None or self._cmd_queue is None:
             self._last_error = "engine not started"
             return False
+        # 記住「使用者現在要停在哪裡」，讓 iOS 的續命機制知道沒有新指令時要重送哪個座標；
+        # Android 用不到這個值，多存一份沒有副作用
+        self._last_known_location = (lat, lng)
         self._loop.call_soon_threadsafe(self._cmd_queue.put_nowait, (lat, lng))
         return True
 
+    async def _ios_keepalive_loop(self) -> None:
+        """
+        每隔 IOS_KEEPALIVE_INTERVAL 秒檢查一次：如果已經超過這個間隔沒有真的送出過
+        定位（不管是使用者的新指令、還是這個迴圈自己補送的），就把「使用者最後要求
+        停留的座標」重新排進佇列，續一次命，避免系統判定連線閒置太久而跳回真實定位。
+
+        受影響的情境都是「送完就不再送」的：手動飛過去、收藏/歷史/地名搜尋飛過去、
+        搖桿放開不再移動、種花或跳躍路徑在某個點停留等待。連續 GPX 播放
+        （self._gpx_process 不是 None）本身連線全程開著不會被系統判定閒置，
+        這個迴圈遇到播放中就跳過，不去跟播放行程搶同一支手機的 DVT 連線。
+        """
+        while True:
+            await asyncio.sleep(2.0)
+            if self._gpx_process is not None:
+                continue
+            last = self._last_known_location
+            if last is None:
+                continue
+            if time.time() - self._last_send_time < IOS_KEEPALIVE_INTERVAL:
+                continue
+            if self._cmd_queue is not None and self._cmd_queue.empty():
+                self._cmd_queue.put_nowait(last)
+
     def clear_location(self) -> None:
+        # 清掉續命目標，不然「還原真實定位」清完沒幾秒，續命迴圈又把使用者最後
+        # 要求的座標重新送回去，等於按了等於沒按
+        self._last_known_location = None
         import threading
         transport = self._active_transport
         if transport == Transport.ANDROID_USB:
@@ -485,6 +536,10 @@ class GpsEngine:
         但其實是被我們自己晾在一旁沒去讀輸出造成的，不是 pymobiledevice3 本身壞掉。
         """
         self.stop_ios_gpx_playback()
+        # 播放期間的「目前位置」由播放行程自己負責，不是續命迴圈該管的範圍；
+        # 清掉舊的續命目標，避免播放結束、連線斷掉之後，續命迴圈把播放前的
+        # 某個舊座標(例如巡邏前手動飛過去的那個點)硬是送回去
+        self._last_known_location = None
         try:
             cmd = [
                 *_pymobiledevice3_cmd_prefix(), "developer", "dvt", "simulate-location", "play",

@@ -171,6 +171,30 @@ def parse_coordinate_text(text: str) -> list[LatLng]:
 
 
 # ============================================================
+# 經度正規化（跨 ±180 換日線）
+# ============================================================
+#
+# 經度是環狀的：+180 跟 -180 是同一條線。直接對經度做加減／內插，在換日線附近
+# 會算出「繞地球一圈」的荒謬結果——例如從 179.9 走到 -179.9，實際上只是往東
+# 跨 0.2 度，但直接相減會得到 -359.8 度，距離、內插、排序全部會錯。
+# 所有「經度加減」跟「兩經度相差多少」都要透過下面兩個函式，不要直接用 + - 。
+
+def normalize_lng(lng: float) -> float:
+    """把經度收斂回 [-180, 180)。超過 +180 就從 -180 那一側繞回來，反之亦然。"""
+    return (lng + 180.0) % 360.0 - 180.0
+
+
+def lng_delta(from_lng: float, to_lng: float) -> float:
+    """兩個經度之間「走最短那一邊」的有號差值，範圍 [-180, 180)。
+    例：lng_delta(179.9, -179.9) == 0.2（往東跨換日線），而不是 -359.8。"""
+    return normalize_lng(to_lng - from_lng)
+
+
+def normalize_point(point: LatLng) -> LatLng:
+    return (point[0], normalize_lng(point[1]))
+
+
+# ============================================================
 # 距離計算（跟專案裡其他地方用同一套公式，保持一致）
 # ============================================================
 
@@ -178,7 +202,7 @@ def _distance_m(p1: LatLng, p2: LatLng) -> float:
     lat1, lng1 = p1
     lat2, lng2 = p2
     dy = (lat2 - lat1) * 111000.0
-    dx = (lng2 - lng1) * 100000.0 * math.cos(math.radians(lat1))
+    dx = lng_delta(lng1, lng2) * 100000.0 * math.cos(math.radians(lat1))
     return math.sqrt(dx * dx + dy * dy)
 
 
@@ -225,7 +249,15 @@ def apply_endpoint_mode(points: list[LatLng], mode: str = "last") -> list[LatLng
     result = list(points)
     if mode == "centroid":
         avg_lat = sum(p[0] for p in points) / len(points)
-        avg_lng = sum(p[1] for p in points) / len(points)
+        # 經度不能直接平均：179 跟 -179 這種跨換日線的組合，直接平均會得到 0
+        # （地球另一邊）。改成把每個經度當成單位圓上的向量取平均角度（環狀平均），
+        # 不跨換日線時結果跟直接平均一樣。
+        sin_sum = sum(math.sin(math.radians(p[1])) for p in points)
+        cos_sum = sum(math.cos(math.radians(p[1])) for p in points)
+        if abs(sin_sum) < 1e-12 and abs(cos_sum) < 1e-12:
+            avg_lng = points[0][1]  # 所有點剛好平均掉（例如正好對蹠），退回用第一點
+        else:
+            avg_lng = normalize_lng(math.degrees(math.atan2(sin_sum, cos_sum)))
         result.append((avg_lat, avg_lng))
     elif mode == "loop":
         result.append(points[0])
@@ -257,7 +289,7 @@ def apply_coordinate_offset(points: list[LatLng], mode: str = "none",
         angle = rng.uniform(0, 2 * math.pi)
         dlat = (distance * math.cos(angle)) / 111000.0
         dlng = (distance * math.sin(angle)) / (100000.0 * math.cos(math.radians(lat)))
-        offset_points.append((lat + dlat, lng + dlng))
+        offset_points.append((lat + dlat, normalize_lng(lng + dlng)))
 
     return offset_points
 
@@ -291,7 +323,7 @@ def generate_circle_path(
             angle = (2 * math.pi * i / num_points) + angle_offset
             dlat = (effective_radius * math.cos(angle)) / 111000.0
             dlng = (effective_radius * math.sin(angle)) / (100000.0 * math.cos(math.radians(lat0)))
-            points.append((lat0 + dlat, lng0 + dlng))
+            points.append((lat0 + dlat, normalize_lng(lng0 + dlng)))
 
     return points
 
@@ -382,10 +414,11 @@ def resample_route(points: list[LatLng], speed_kmh: float, interval_seconds: flo
         if seg_dist <= 0:
             continue
         n_steps = max(1, int(seg_dist // step_m))
+        dlng = lng_delta(p1[1], p2[1])
         for s in range(1, n_steps + 1):
             ratio = min(1.0, (s * step_m) / seg_dist)
             lat = p1[0] + (p2[0] - p1[0]) * ratio
-            lng = p1[1] + (p2[1] - p1[1]) * ratio
+            lng = normalize_lng(p1[1] + dlng * ratio)
             out.append((lat, lng))
         if out[-1] != p2:
             out.append(p2)
@@ -502,3 +535,490 @@ def write_txt(points: list[LatLng], file_path: str) -> None:
     with open(file_path, "w", encoding="utf-8") as f:
         for lat, lng in points:
             f.write(f"{lat},{lng}\n")
+
+
+# ============================================================
+# 其他格式匯入（CSV / JSON）
+# ============================================================
+
+_NUMBER_PATTERN = re.compile(r'(?<![A-Za-z0-9])-?\d+(?:\.\d+)?(?![A-Za-z0-9])')
+
+
+def _first_two_numbers_in_line(line: str) -> Optional[LatLng]:
+    """
+    在一行文字裡找「前兩個帶正負號的數字」當 lat/lon，不管它們前面有沒有名稱、
+    序號之類的非數字欄位（真實世界的 CSV 常常是「名稱,緯度,經度」或有表頭列，
+    嚴格假設「第一、第二個逗號分隔欄位就是座標」反而很容易漏掉——實測過確實
+    會漏掉「名稱,25.0,121.5」這種常見格式）。
+    """
+    matches = _NUMBER_PATTERN.findall(line)
+    if len(matches) < 2:
+        return None
+    try:
+        lat, lng = float(matches[0]), float(matches[1])
+    except ValueError:
+        return None
+    if -90 <= lat <= 90 and -180 <= lng <= 180:
+        return (lat, lng)
+    return None
+
+
+def read_csv(file_path: str) -> list[LatLng]:
+    """
+    從 CSV 檔案粗略擷取座標：每行找出前兩個數字當 lat/lon，不要求嚴格的欄位對應
+    （不同來源的 CSV 欄位順序、有沒有表頭、有沒有名稱欄位都不一樣，嚴格解析
+    反而容易失敗；跟 FreeWay 規格書 §14.2 描述的「用正規表示式擷取前兩個數字」
+    同一種策略）。表頭列（例如「name,lat,lng」）沒有兩個看起來像座標的數字，
+    會被自然跳過，不用另外偵測有沒有表頭。
+    """
+    with open(file_path, "r", encoding="utf-8-sig", errors="replace") as f:
+        lines = f.read().splitlines()
+    points: list[LatLng] = []
+    for line in lines:
+        point = _first_two_numbers_in_line(line)
+        if point is not None:
+            points.append(point)
+    return points
+
+
+def _scan_text_for_coordinates(text: str) -> list[LatLng]:
+    """逐行掃描任意文字，每行找前兩個數字當座標——跟 read_csv 同一套邏輯，用在
+    JSON 解析失敗時的最後手段，不用 parse_coordinate_text()（那個函式假設座標是
+    「該行第一、二個逗號分隔欄位」，遇到座標前面還有其他文字就會漏掉，不適合
+    這裡「格式完全不明」的情境）。"""
+    points: list[LatLng] = []
+    for line in text.splitlines():
+        point = _first_two_numbers_in_line(line)
+        if point is not None:
+            points.append(point)
+    return points
+
+
+def read_json(file_path: str) -> list[LatLng]:
+    """
+    從 JSON 檔案擷取座標，接受兩種常見格式：
+      [[lat, lon], [lat, lon], ...]
+      [{"lat": .., "lng"/"lon": ..}, ...]
+    格式不符或解析失敗時，退回逐行掃描文字裡的數字當最後手段，不直接判失敗。
+    """
+    import json as _json
+
+    with open(file_path, "r", encoding="utf-8-sig", errors="replace") as f:
+        raw = f.read()
+
+    try:
+        data = _json.loads(raw)
+    except Exception:
+        return _scan_text_for_coordinates(raw)
+
+    points: list[LatLng] = []
+    if isinstance(data, list):
+        for item in data:
+            if isinstance(item, (list, tuple)) and len(item) >= 2:
+                try:
+                    lat, lng = float(item[0]), float(item[1])
+                except (TypeError, ValueError):
+                    continue
+                if -90 <= lat <= 90 and -180 <= lng <= 180:
+                    points.append((lat, lng))
+            elif isinstance(item, dict):
+                lat = item.get("lat")
+                lng = item.get("lng", item.get("lon"))
+                if lat is None or lng is None:
+                    continue
+                try:
+                    lat, lng = float(lat), float(lng)
+                except (TypeError, ValueError):
+                    continue
+                if -90 <= lat <= 90 and -180 <= lng <= 180:
+                    points.append((lat, lng))
+
+    return points if points else _scan_text_for_coordinates(raw)
+
+
+# ============================================================
+# 路線最佳化（開放路徑近似最短解：nearest-neighbor + 2-opt + 片段搬移）
+# ============================================================
+
+def optimize_route(points: list[LatLng]) -> list[LatLng]:
+    """
+    比 nearest_neighbor_order() 更講究的路線最佳化，邏輯照 FreeWay 規格書 §7：
+
+      候選起點數 = min(n, 150)
+      對每個候選起點：
+        1. nearest-neighbor 建立初始路徑
+        2. 最多 30 個改善回合，每回合嘗試：
+           - 所有 2-opt 區段反轉
+           - 長度 1/2/3 片段搬移（正向、反向插入都比較）
+        3. 該回合完全沒有改善就提前停止
+      回傳所有候選裡總長度最短的路徑
+
+    這是啟發式近似解，不保證全域最佳解（真正最短路徑是 NP-hard 問題）。內部用距離的
+    「增減量」而不是每次重算整條路徑長度，才有辦法在合理時間內跑完（點數多時仍可能較慢，
+    呼叫端如果用在幾百個點以上的路線建議自行評估耗時）。
+    """
+    n = len(points)
+    if n < 3:
+        return list(points)
+
+    dist = [[_distance_m(points[i], points[j]) for j in range(n)] for i in range(n)]
+
+    def path_length(order: list[int]) -> float:
+        return sum(dist[order[k]][order[k + 1]] for k in range(len(order) - 1))
+
+    def nearest_neighbor_from(start: int) -> list[int]:
+        remaining = set(range(n))
+        remaining.discard(start)
+        order = [start]
+        current = start
+        while remaining:
+            nxt = min(remaining, key=lambda i: dist[current][i])
+            order.append(nxt)
+            remaining.discard(nxt)
+            current = nxt
+        return order
+
+    def two_opt_pass(order: list[int]) -> tuple[list[int], bool]:
+        improved = False
+        length = len(order)
+        for i in range(length - 2):
+            a, b = order[i], order[i + 1]
+            for j in range(i + 2, length - 1):
+                c, d = order[j], order[j + 1]
+                delta = (dist[a][c] + dist[b][d]) - (dist[a][b] + dist[c][d])
+                if delta < -1e-9:
+                    order[i + 1:j + 1] = reversed(order[i + 1:j + 1])
+                    improved = True
+                    b = order[i + 1]
+        return order, improved
+
+    def relocation_pass(order: list[int]) -> tuple[list[int], bool]:
+        improved = False
+        for seg_len in (1, 2, 3):
+            i = 0
+            while i + seg_len <= len(order):
+                n_order = len(order)
+                removal_gain = 0.0
+                if i > 0:
+                    removal_gain += dist[order[i - 1]][order[i]]
+                if i + seg_len < n_order:
+                    removal_gain += dist[order[i + seg_len - 1]][order[i + seg_len]]
+                if i > 0 and i + seg_len < n_order:
+                    removal_gain -= dist[order[i - 1]][order[i + seg_len]]
+
+                segment = order[i:i + seg_len]
+                rest = order[:i] + order[i + seg_len:]
+                best_gain = 1e-9
+                best_candidate = None
+                variants = (segment,) if seg_len == 1 else (segment, list(reversed(segment)))
+                for insert_at in range(len(rest) + 1):
+                    for seg in variants:
+                        first, last = seg[0], seg[-1]
+                        cost = 0.0
+                        if insert_at > 0:
+                            cost += dist[rest[insert_at - 1]][first]
+                        if insert_at < len(rest):
+                            cost += dist[last][rest[insert_at]]
+                        if 0 < insert_at < len(rest):
+                            cost -= dist[rest[insert_at - 1]][rest[insert_at]]
+                        net_gain = removal_gain - cost
+                        if net_gain > best_gain:
+                            best_gain = net_gain
+                            best_candidate = rest[:insert_at] + seg + rest[insert_at:]
+                if best_candidate is not None:
+                    order = best_candidate
+                    improved = True
+                    continue  # order 變了，同一個 i 重新檢查一次
+                i += 1
+        return order, improved
+
+    candidate_starts = range(n) if n <= 150 else range(150)
+    best_order: Optional[list[int]] = None
+    best_length = float("inf")
+
+    for start in candidate_starts:
+        order = nearest_neighbor_from(start)
+        for _round in range(30):
+            order, improved_2opt = two_opt_pass(order)
+            order, improved_reloc = relocation_pass(order)
+            if not improved_2opt and not improved_reloc:
+                break
+        length = path_length(order)
+        if length < best_length:
+            best_length = length
+            best_order = order
+
+    return [points[i] for i in best_order]
+
+
+# ============================================================
+# RouteStep：帶等待時間的路徑點（種花路徑／跳躍路徑專用）
+# ============================================================
+
+@dataclass
+class RouteStep:
+    """
+    帶等待時間的路徑點。跟純座標的 LatLng 不同，這裡多了 wait_s——代表「移動到這個點之後，
+    停留這麼多秒再繼續下一步」，種花路徑（圈的起訖點）跟跳躍路徑（到點/出發前）都需要這個
+    概念，一般路線／Z字巡邏用不到，繼續用純座標清單就好，不用套用這個模型。
+    """
+    lat: float
+    lng: float
+    wait_s: float = 0.0
+
+
+def _linear_walk_steps(
+    from_point: LatLng, to_point: LatLng, speed_kmh: float
+) -> list[RouteStep]:
+    """兩點間用線性插值切成多個中間步驟，公式跟既有一般連續移動(§6.5)同一套 tick 邏輯。"""
+    distance = _distance_m(from_point, to_point)
+    speed_mps = max(0.35, speed_kmh * 1000.0 / 3600.0 * 0.5)
+    steps_count = max(1, min(5000, math.ceil(distance / speed_mps))) if distance > 0 else 0
+
+    out: list[RouteStep] = []
+    from_lat, from_lng = from_point
+    to_lat, to_lng = to_point
+    dlng = lng_delta(from_lng, to_lng)
+    for i in range(1, steps_count + 1):
+        ratio = i / steps_count
+        out.append(RouteStep(
+            lat=from_lat + (to_lat - from_lat) * ratio,
+            lng=normalize_lng(from_lng + dlng * ratio),
+        ))
+    return out
+
+
+# ============================================================
+# 種花路徑生成
+# ============================================================
+
+def flower_circle_points(
+    center: LatLng,
+    radius_m: float,
+    turns: float,
+    speed_kmh: float,
+    arrival_wait: float,
+    departure_wait: float,
+) -> list[RouteStep]:
+    """
+    對一個花點中心產生繞圈路徑，附帶等待時間。圓周座標公式、取樣點數公式都照 FreeWay
+    規格書 §8.2/§8.3 原樣實作（含 111320 這個比我們專案別處常用的 111000 更精確的地球
+    半徑常數，僅限這個函式使用，不影響 _distance_m 等既有共用函式，避免動到其他既有
+    功能的行為）。第一點套 arrival_wait，最後一點套 departure_wait。
+    """
+    lat0, lng0 = center
+    speed_mps = max(0.35, speed_kmh * 1000.0 / 3600.0)
+    circle_distance = 2 * math.pi * radius_m * max(turns, 1e-6)
+    steps = max(12, min(5000, math.ceil(circle_distance / (speed_mps * 0.5))))
+
+    total_angle = 2 * math.pi * turns
+    out: list[RouteStep] = []
+    for i in range(steps):
+        angle = total_angle * i / (steps - 1) if steps > 1 else 0.0
+        dlat = (radius_m / 111320.0) * math.cos(angle)
+        dlng = (radius_m / (111320.0 * max(0.1, math.cos(math.radians(lat0))))) * math.sin(angle)
+        wait_s = 0.0
+        if i == 0:
+            wait_s = arrival_wait
+        elif i == steps - 1:
+            wait_s = departure_wait
+        out.append(RouteStep(lat=lat0 + dlat, lng=normalize_lng(lng0 + dlng), wait_s=wait_s))
+    return out
+
+
+def build_flower_route_detailed(
+    centers: list[LatLng],
+    sort_mode: str,
+    plant_mode: str,
+    ring1: dict,
+    ring2: Optional[dict],
+    speed_kmh: float,
+) -> tuple[list[RouteStep], list[tuple[int, int, int]]]:
+    """
+    跟 build_flower_route() 同一套產生邏輯，但額外回傳「同步點」清單，
+    給團體種花用：每跑完一個花點的一圈就是一個同步點，房主要在這裡等團員跟上。
+
+    回傳 (steps, boundaries)，boundaries 是 [(steps 的索引, 第幾圈, 第幾個花點), ...]，
+    索引指的是「走完這一步就抵達同步點」，圈從 1 起算、花點從 0 起算
+    （對應規格書 §11.8 boundary 公式裡的 ring 與 center）。
+    """
+    if not centers:
+        return [], []
+    ordered_centers = optimize_route(centers) if sort_mode == "shortest" else list(centers)
+
+    steps: list[RouteStep] = []
+    boundaries: list[tuple[int, int, int]] = []
+
+    def append_ring(ring_settings: dict, ring_no: int) -> None:
+        for center_idx, center in enumerate(ordered_centers):
+            ring_steps = flower_circle_points(
+                center,
+                ring_settings["radius"],
+                ring_settings["turns"],
+                speed_kmh,
+                ring_settings["arrival_wait"],
+                ring_settings["departure_wait"],
+            )
+            if not ring_steps:
+                continue
+            if plant_mode == "walk" and steps:
+                last = steps[-1]
+                steps.extend(_linear_walk_steps((last.lat, last.lng), (ring_steps[0].lat, ring_steps[0].lng), speed_kmh))
+            steps.extend(ring_steps)
+            boundaries.append((len(steps) - 1, ring_no, center_idx))
+
+    append_ring(ring1, 1)
+    if ring2:
+        append_ring(ring2, 2)
+
+    return steps, boundaries
+
+
+def build_flower_route(
+    centers: list[LatLng],
+    sort_mode: str,
+    plant_mode: str,
+    ring1: dict,
+    ring2: Optional[dict],
+    speed_kmh: float,
+) -> list[RouteStep]:
+    """
+    串接多個花點的種花路徑。ring1/ring2 格式：
+      {"radius": float, "turns": float, "arrival_wait": float, "departure_wait": float}
+    ring2 傳 None 代表不啟用第二圈。
+    sort_mode: "shortest"（呼叫 optimize_route）／"paste"（貼上原順序）。
+    plant_mode: "walk"（花點之間直線走過去）／"teleport"（直接瞬移到下一花點起點）。
+    執行順序照規格書 §8.4：第一圈全部花點跑完，才進第二圈全部花點（若啟用）。
+    """
+    return build_flower_route_detailed(centers, sort_mode, plant_mode, ring1, ring2, speed_kmh)[0]
+
+
+# ============================================================
+# 跳躍路徑生成
+# ============================================================
+
+def build_jump_route(
+    points: list[LatLng],
+    before_wait: float,
+    after_wait: float,
+    forward_m: float,
+) -> list[RouteStep]:
+    """
+    跳躍路徑，照規格書 §9.2：
+      瞬移到目標點 → 到達後等待 after_wait 秒 → 朝下一個目標方向走 forward_m 公尺
+      → 等待 before_wait 秒 → 瞬移到下一個目標
+    最後一個點不用再往「下一個」方向走，只停留 after_wait。
+    """
+    if not points:
+        return []
+    steps: list[RouteStep] = []
+    n = len(points)
+    for idx, (lat, lng) in enumerate(points):
+        steps.append(RouteStep(lat=lat, lng=lng, wait_s=after_wait))
+        if idx < n - 1 and forward_m > 0:
+            next_lat, next_lng = points[idx + 1]
+            distance = _distance_m((lat, lng), (next_lat, next_lng))
+            if distance > 0:
+                ratio = min(1.0, forward_m / distance)
+                steps.append(RouteStep(
+                    lat=lat + (next_lat - lat) * ratio,
+                    lng=normalize_lng(lng + lng_delta(lng, next_lng) * ratio),
+                    wait_s=before_wait,
+                ))
+    return steps
+
+
+# ============================================================
+# 同心圓生成
+# ============================================================
+
+def generate_concentric_circles(
+    center: LatLng,
+    start_radius: float,
+    ring_count: int,
+    radius_step: float,
+    points_per_ring: int,
+) -> list[LatLng]:
+    """
+    由圓心向外生成多層同心圓，每圈半徑遞增 radius_step，各圈平均分布 points_per_ring 個點。
+    半徑跟每圈間距低於 25 公尺時強制拉到 25 公尺（照規格書 §10.2，降低相鄰路線過度重疊）。
+    回傳純座標清單，沿用既有 PatrolWorker.set_segments() 執行路徑即可，不需要 RouteStep。
+    """
+    start_radius = max(25.0, start_radius)
+    radius_step = max(25.0, radius_step)
+    points_per_ring = max(4, points_per_ring)
+
+    lat0, lng0 = center
+    result: list[LatLng] = []
+    for ring in range(max(1, ring_count)):
+        radius = start_radius + ring * radius_step
+        for i in range(points_per_ring):
+            angle = 2 * math.pi * i / points_per_ring
+            dlat = (radius / 111320.0) * math.cos(angle)
+            dlng = (radius / (111320.0 * max(0.1, math.cos(math.radians(lat0))))) * math.sin(angle)
+            result.append((lat0 + dlat, normalize_lng(lng0 + dlng)))
+    return result
+
+
+# ============================================================
+# RouteStep 時間軸／GPX 匯出（種花／跳躍路徑專用，含停留等待）
+# ============================================================
+#
+# route_timeline()/resample_route()/write_gpx_timed() 都是「純距離／時速換算時間」的
+# 模型，沒有辦法表示「在某個點停留 N 秒再走」——兩個座標相同的點之間距離是 0，換算出
+# 來的時間增量也會是 0，不會產生真正的停留。RouteStep 需要一套會把 wait_s 算進時間軸
+# 的獨立函式，不能沿用上面那一套。
+
+def route_step_timeline(steps: list[RouteStep], speed_kmh: float) -> list[tuple[float, float, float]]:
+    """
+    把一串 RouteStep 換算成 [(累積秒數, lat, lng), ...]。移動距離部分跟 route_timeline()
+    同一套「距離/時速」邏輯；每個 RouteStep 的 wait_s 會在該點的座標上多插入一個「等待
+    結束」的時間點，兩個時間點座標相同、但時間不同，重播時就會在那個點真正停留。
+
+    種花／跳躍路徑產生器本身在轉折/繞圈處已經有夠密的取樣點（見 flower_circle_points()／
+    _linear_walk_steps()），不需要再另外呼叫 resample_route() 加密。
+    """
+    if not steps:
+        return []
+    speed_mps = max(speed_kmh, 0.1) / 3.6
+
+    timeline: list[tuple[float, float, float]] = [(0.0, steps[0].lat, steps[0].lng)]
+    elapsed = 0.0
+    if steps[0].wait_s > 0:
+        elapsed += steps[0].wait_s
+        timeline.append((elapsed, steps[0].lat, steps[0].lng))
+
+    for i in range(1, len(steps)):
+        prev, cur = steps[i - 1], steps[i]
+        elapsed += _distance_m((prev.lat, prev.lng), (cur.lat, cur.lng)) / speed_mps
+        timeline.append((elapsed, cur.lat, cur.lng))
+        if cur.wait_s > 0:
+            elapsed += cur.wait_s
+            timeline.append((elapsed, cur.lat, cur.lng))
+
+    return timeline
+
+
+def write_gpx_timed_from_steps(
+    steps: list[RouteStep], file_path: str, speed_kmh: float, name: str = "route"
+) -> None:
+    """跟 write_gpx_timed() 一樣輸出帶 <time> 的 GPX 檔，但時間軸改用 route_step_timeline()
+    算出（含每個點的停留等待），給 iOS 連續播放種花／跳躍路徑用。"""
+    from datetime import datetime, timedelta, timezone
+
+    timeline = route_step_timeline(steps, speed_kmh)
+    base_time = datetime(2020, 1, 1, tzinfo=timezone.utc)
+
+    lines = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        '<gpx version="1.1" creator="FakeGpsPatrol-GpxTools">',
+        f'  <trk><name>{name}</name><trkseg>',
+    ]
+    for elapsed, lat, lng in timeline:
+        ts = (base_time + timedelta(seconds=elapsed)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+        lines.append(f'    <trkpt lat="{lat}" lon="{lng}"><time>{ts}</time></trkpt>')
+    lines.append('  </trkseg></trk>')
+    lines.append('</gpx>')
+
+    with open(file_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))

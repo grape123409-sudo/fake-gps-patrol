@@ -60,6 +60,31 @@ class PatrolWorker(QObject):
         # iOS 連續播放模式用的暫存 GPX 檔案路徑（固定檔名，每次巡邏重新覆寫即可）
         self._ios_gpx_path = os.path.join(tempfile.gettempdir(), f"fakegps_patrol_{label}.gpx")
 
+        # 路線執行模式："once"(跑完就停，預設值＝原本行為) / "reverse"(跑到底再反向
+        # 走回起點算一輪) / "loop"(持續循環，忽略 repeat_count，直到使用者按停止)。
+        # 這幾個屬性只有 GPX 頁面的「一般路線」會實際傳非預設值進來；Z字巡邏(_start_patrol)
+        # 呼叫 start() 時完全不傳這些新參數，永遠維持 once/repeat=1，行為不受影響。
+        self.run_mode = "once"
+        self.repeat_count = 1
+        self._laps_done = 0
+        self._reverse_pending = False
+
+        # 種花／跳躍路徑（RouteStep 序列）專用的暫存路徑清單，跟 self.segments 是分開的
+        # 執行路徑，set_segments()/start() 那條既有路線完全不會用到這個屬性
+        self._timed_steps: list = []
+
+        # ---- 團體種花（房主）用的掛鉤，預設 None＝完全不影響單機執行 ----
+        # on_step(step_idx, lat, lng, lap)：每送出一個座標成功後呼叫，房主用來廣播進度。
+        # wait_barrier(step_idx, lap) -> bool：走到同步點時呼叫，會一直擋住直到所有團員
+        #   跟上（回傳 True 繼續、False 代表要中止）。兩個都在巡邏執行緒裡被呼叫，
+        #   實作端只能發 Qt signal／設 Event，不可以直接碰 UI 元件。
+        self.on_step = None
+        self.wait_barrier = None
+        # 團體模式強制走逐點模式：同步屏障需要「每一點送出後確認」才能等人，
+        # iOS 的連續 GPX 播放是一次播完整條、中途沒有逐點回報，沒辦法配合同步，
+        # 所以團體種花時即使是 iOS 也走 tick 模式。單機執行不受影響。
+        self.force_tick_mode = False
+
     @property
     def patrol_path(self) -> list[tuple[float, float]]:
         if 0 <= self.segment_idx < len(self.segments):
@@ -79,13 +104,22 @@ class PatrolWorker(QObject):
         self.segment_idx = 0
         self.node_idx = 0
 
-    def start(self, speed_kmh: float) -> None:
+    def start(self, speed_kmh: float, run_mode: str = "once", repeat_count: int = 1) -> None:
+        """
+        run_mode/repeat_count 只有 GPX 頁面「一般路線」的執行模式選單會實際傳非預設值——
+        Z字巡邏(_start_patrol)呼叫這個方法時完全不帶這兩個參數，永遠是 once/1，
+        跟這個功能加進來之前的行為完全一樣。
+        """
         if self._is_patrolling:
             return
         if not self.patrol_path:
             self.logMessage.emit("⚠️ 請先產生弓字型軌道！")
             return
         self.speed_kmh = speed_kmh
+        self.run_mode = run_mode
+        self.repeat_count = max(1, repeat_count)
+        self._laps_done = 0
+        self._reverse_pending = False
         self._is_patrolling = True
         self._is_paused = False
         if self.node_idx >= len(self.patrol_path):
@@ -101,6 +135,74 @@ class PatrolWorker(QObject):
         transport = getattr(self.engine, "active_transport", None)
         value = getattr(transport, "value", "") or ""
         return value.startswith("ios")
+
+    def start_timed_steps(
+        self,
+        steps: list[gpx_tools.RouteStep],
+        speed_kmh: float,
+        run_mode: str = "once",
+        repeat_count: int = 1,
+    ) -> None:
+        """
+        種花路徑／跳躍路徑專用的獨立進入點，吃 gpx_tools.RouteStep（帶等待秒數）序列，
+        跟 set_segments()/start() 那組既有進入點完全分開，互不影響——Z字巡邏跟「一般
+        路線」都還是走 set_segments()/start()，這個方法只有種花／跳躍面板會呼叫。
+        """
+        if self._is_patrolling:
+            return
+        if not steps:
+            self.logMessage.emit("⚠️ 路線是空的，無法開始！")
+            return
+        self.speed_kmh = speed_kmh
+        self.run_mode = run_mode
+        self.repeat_count = max(1, repeat_count)
+        self._laps_done = 0
+        self._reverse_pending = False
+        self._timed_steps = list(steps)
+        self._is_patrolling = True
+        self._is_paused = False
+        use_ios_playback = self._is_ios_transport() and not self.force_tick_mode
+        run_target = self._run_timed_ios if use_ios_playback else self._run_timed_android
+        self._thread = threading.Thread(target=run_target, daemon=True, name=f"Patrol-{self.label}")
+        self._thread.start()
+
+    def _handle_timed_completion(self) -> bool:
+        """跟 _handle_route_completion() 同樣的 run_mode 邏輯，只是操作對象是
+        self._timed_steps（RouteStep 序列）而不是 self.segments。"""
+        if self.run_mode == "once":
+            return False
+        if self.run_mode == "reverse":
+            if not self._reverse_pending:
+                self._timed_steps = list(reversed(self._timed_steps))
+                self._reverse_pending = True
+                self.logMessage.emit(f"↩️ [{self.label}] 已到終點，反向走回起點")
+                return True
+            self._timed_steps = list(reversed(self._timed_steps))
+            self._reverse_pending = False
+            self._laps_done += 1
+            if self._laps_done >= self.repeat_count:
+                return False
+            self.logMessage.emit(f"🔁 [{self.label}] 第 {self._laps_done + 1}/{self.repeat_count} 輪開始")
+            return True
+        if self.run_mode == "loop":
+            self.logMessage.emit(f"🔁 [{self.label}] 持續循環，重新開始")
+            return True
+        return False
+
+    def _sleep_pausable(self, duration: float) -> bool:
+        """睡滿 duration 秒，但持續檢查暫停/停止狀態；暫停時延長等待、停止時提前返回。
+        回傳 True 代表正常睡完，False 代表中途被停止（呼叫端應該直接結束迴圈）。"""
+        remaining = duration
+        while remaining > 0:
+            if not self._is_patrolling:
+                return False
+            if self._is_paused:
+                time.sleep(0.2)
+                continue
+            chunk = min(0.2, remaining)
+            time.sleep(chunk)
+            remaining -= chunk
+        return True
 
     def pause(self) -> None:
         self._is_paused = True
@@ -125,6 +227,46 @@ class PatrolWorker(QObject):
         self.segmentAdvanced.emit(self.segment_idx, len(self.segments))
         return True
 
+    def _handle_route_completion(self) -> bool:
+        """
+        全部 segments 都跑完之後，依 run_mode 決定要不要繼續下一輪。
+        回傳 True 代表已經重設好 segment_idx/node_idx，呼叫端應該 continue 主迴圈；
+        False 代表真的結束，呼叫端應該 break。
+
+        run_mode == "once" 時一定回傳 False——這正是這個功能加進來之前，唯一存在過
+        的行為，Z字巡邏永遠只會走到這個分支。
+        """
+        if self.run_mode == "once":
+            return False
+
+        if self.run_mode == "reverse":
+            if not self._reverse_pending:
+                # 正向跑完，反轉整條路線再跑一次「回到起點」
+                self.segments = [list(reversed(seg)) for seg in reversed(self.segments)]
+                self.segment_idx = 0
+                self.node_idx = 0
+                self._reverse_pending = True
+                self.logMessage.emit(f"↩️ [{self.label}] 已到終點，反向走回起點")
+                return True
+            # 反向也跑完了，這樣才算一輪；轉回正向準備開始下一輪（如果還有的話）
+            self.segments = [list(reversed(seg)) for seg in reversed(self.segments)]
+            self._reverse_pending = False
+            self._laps_done += 1
+            if self._laps_done >= self.repeat_count:
+                return False
+            self.segment_idx = 0
+            self.node_idx = 0
+            self.logMessage.emit(f"🔁 [{self.label}] 第 {self._laps_done + 1}/{self.repeat_count} 輪開始")
+            return True
+
+        if self.run_mode == "loop":
+            self.segment_idx = 0
+            self.node_idx = 0
+            self.logMessage.emit(f"🔁 [{self.label}] 持續循環，重新開始")
+            return True
+
+        return False
+
     def _remaining_distance_m(self) -> float:
         path = self.patrol_path
         total = 0.0
@@ -133,7 +275,7 @@ class PatrolWorker(QObject):
             for i in range(self.node_idx, len(path)):
                 tlat, tlng = path[i]
                 dy = (tlat - lat) * 111000.0
-                dx = (tlng - lng) * 100000.0 * math.cos(math.radians(lat))
+                dx = gpx_tools.lng_delta(lng, tlng) * 100000.0 * math.cos(math.radians(lat))
                 total += math.hypot(dx, dy)
                 lat, lng = tlat, tlng
         for seg_i in range(self.segment_idx + 1, len(self.segments)):
@@ -142,7 +284,7 @@ class PatrolWorker(QObject):
                 lat1, lng1 = seg[i]
                 lat2, lng2 = seg[i + 1]
                 dy = (lat2 - lat1) * 111000.0
-                dx = (lng2 - lng1) * 100000.0 * math.cos(math.radians(lat1))
+                dx = gpx_tools.lng_delta(lng1, lng2) * 100000.0 * math.cos(math.radians(lat1))
                 total += math.hypot(dx, dy)
         return total
 
@@ -164,11 +306,13 @@ class PatrolWorker(QObject):
             if self.node_idx >= len(path):
                 if self._advance_segment():
                     continue
+                if self._handle_route_completion():
+                    continue
                 break
 
             target_lat, target_lng = path[self.node_idx]
             dy = (target_lat - self.curr_lat) * 111000.0
-            dx = (target_lng - self.curr_lng) * 100000.0 * math.cos(math.radians(self.curr_lat))
+            dx = gpx_tools.lng_delta(self.curr_lng, target_lng) * 100000.0 * math.cos(math.radians(self.curr_lat))
             dist = math.hypot(dx, dy)
 
             if dist <= step_distance:
@@ -180,7 +324,7 @@ class PatrolWorker(QObject):
                 self.curr_lng += (step_distance * math.cos(angle)) / (100000.0 * math.cos(math.radians(self.curr_lat)))
 
             self.curr_lat = round(self.curr_lat, 6)
-            self.curr_lng = round(self.curr_lng, 6)
+            self.curr_lng = round(gpx_tools.normalize_lng(self.curr_lng), 6)
 
             self.engine.set_location(self.curr_lat, self.curr_lng)
 
@@ -307,7 +451,18 @@ class PatrolWorker(QObject):
                     time.sleep(0.2)
                 continue
 
-            # 沒有被暫停打斷，代表整條路線正常播完
+            # 沒有被暫停打斷，代表整條路線正常播完；依 run_mode 決定要不要跑下一輪
+            # （once 時 _handle_route_completion 一定回傳 False，維持原本「播完就停」的行為）
+            if self._is_patrolling and self._handle_route_completion():
+                full_route = []
+                for seg in self.segments:
+                    full_route.extend(seg)
+                remaining = list(full_route) if len(full_route) >= 2 else []
+                if remaining:
+                    self.curr_lat, self.curr_lng = remaining[0]
+                    distance_done = 0.0
+                continue
+
             remaining = []
 
         self.engine.stop_ios_gpx_playback()
@@ -333,3 +488,177 @@ class PatrolWorker(QObject):
                 return lat, lng, i - 1
         last = timeline[-1]
         return last[1], last[2], len(timeline) - 1
+
+    # ---------------- 種花／跳躍路徑（RouteStep）專用執行迴圈 ----------------
+
+    def _run_timed_android(self) -> None:
+        """RouteStep 序列的 Android 版執行迴圈：逐點送座標，抵達後依 wait_s 停留。"""
+        self.logMessage.emit(f"🏃 [{self.label}] 自動巡邏啟動（自訂路線模式）！目標時速: {self.speed_kmh} km/h")
+        tick_rate = 0.5
+
+        if not self._timed_steps:
+            self._is_patrolling = False
+            self.finished.emit()
+            return
+
+        idx = 0
+        self.curr_lat, self.curr_lng = self._timed_steps[0].lat, self._timed_steps[0].lng
+
+        while self._is_patrolling:
+            if self._is_paused:
+                time.sleep(0.2)
+                continue
+
+            steps = self._timed_steps
+            if idx >= len(steps):
+                if self._handle_timed_completion():
+                    idx = 0
+                    if self._timed_steps:
+                        self.curr_lat, self.curr_lng = self._timed_steps[0].lat, self._timed_steps[0].lng
+                    continue
+                break
+
+            target = steps[idx]
+            speed_mps = self.speed_kmh / 3.6
+            step_distance = speed_mps * tick_rate
+            dy = (target.lat - self.curr_lat) * 111000.0
+            dx = gpx_tools.lng_delta(self.curr_lng, target.lng) * 100000.0 * math.cos(math.radians(self.curr_lat))
+            dist = math.hypot(dx, dy)
+
+            if dist <= step_distance:
+                self.curr_lat = round(target.lat, 6)
+                self.curr_lng = round(gpx_tools.normalize_lng(target.lng), 6)
+                self.engine.set_location(self.curr_lat, self.curr_lng)
+                self.positionUpdated.emit(self.curr_lat, self.curr_lng, idx + 1, len(steps))
+                # 團體種花：座標真的送出去之後才廣播進度／等團員跟上，
+                # 順序跟規格書 §11.6「房主只在本機裝置定位成功後發布」一致
+                if self.on_step is not None:
+                    self.on_step(idx, self.curr_lat, self.curr_lng, self._laps_done)
+                if self.wait_barrier is not None and not self.wait_barrier(idx, self._laps_done):
+                    break
+                wait_s = target.wait_s
+                idx += 1
+                if wait_s > 0:
+                    self.remainingTimeUpdated.emit(f"停留中（{wait_s:.0f}秒）")
+                    if not self._sleep_pausable(wait_s):
+                        break
+                else:
+                    time.sleep(tick_rate)
+            else:
+                angle = math.atan2(dy, dx)
+                self.curr_lat += (step_distance * math.sin(angle)) / 111000.0
+                self.curr_lng += (step_distance * math.cos(angle)) / (100000.0 * math.cos(math.radians(self.curr_lat)))
+                self.curr_lat = round(self.curr_lat, 6)
+                self.curr_lng = round(gpx_tools.normalize_lng(self.curr_lng), 6)
+                self.engine.set_location(self.curr_lat, self.curr_lng)
+                self.positionUpdated.emit(self.curr_lat, self.curr_lng, idx, len(steps))
+                time.sleep(tick_rate)
+
+        self._is_patrolling = False
+        self.logMessage.emit(f"⏹️ [{self.label}] 巡邏迴圈結束。")
+        self.finished.emit()
+
+    def _find_resume_step_index(self, steps: list[gpx_tools.RouteStep], elapsed: float) -> int:
+        """暫停時，依目前已經過的秒數(elapsed)算出走到 steps 的第幾個索引，
+        用跟 gpx_tools.route_step_timeline() 完全同一套時間累加公式，確保跟實際
+        播放進度一致。回傳的索引「已經走完」，續播時要從這個索引之後接續。"""
+        speed_mps = max(self.speed_kmh, 0.1) / 3.6
+        t = steps[0].wait_s if steps[0].wait_s > 0 else 0.0
+        if elapsed <= t:
+            return 0
+        for i in range(1, len(steps)):
+            prev, cur = steps[i - 1], steps[i]
+            t += gpx_tools.distance_m((prev.lat, prev.lng), (cur.lat, cur.lng)) / speed_mps
+            if cur.wait_s > 0:
+                t += cur.wait_s
+            if elapsed <= t:
+                return i
+        return len(steps) - 1
+
+    def _run_timed_ios(self) -> None:
+        """
+        RouteStep 序列的 iOS 連續播放版本，架構跟 _run_ios_gpx() 相同（一次連線播完
+        整段路線，避免逐點重連造成的延遲跟跳動），差別是時間軸改用
+        gpx_tools.route_step_timeline()/write_gpx_timed_from_steps()，讓每個點的
+        wait_s 停留時間真的反映在播放進度裡。
+
+        種花／跳躍路徑產生器本身在轉折/繞圈處已經有夠密的取樣點，不需要像
+        _run_ios_gpx() 那樣額外呼叫 resample_route() 加密。
+        """
+        self.logMessage.emit(f"🏃 [{self.label}] 自動巡邏啟動（自訂路線 iOS 連續播放模式）！目標時速: {self.speed_kmh} km/h")
+
+        remaining = list(self._timed_steps)
+        if not remaining:
+            self._is_patrolling = False
+            self.finished.emit()
+            return
+
+        self.curr_lat, self.curr_lng = remaining[0].lat, remaining[0].lng
+
+        while self._is_patrolling and remaining:
+            if self._is_paused:
+                time.sleep(0.2)
+                continue
+
+            if len(remaining) < 2 and remaining[0].wait_s <= 0:
+                break
+
+            try:
+                gpx_tools.write_gpx_timed_from_steps(remaining, self._ios_gpx_path, self.speed_kmh)
+            except Exception as e:
+                self.logMessage.emit(f"⚠️ [{self.label}] 寫入巡邏 GPX 檔案失敗，改用逐點送座標模式：{e}")
+                self._run_timed_android()
+                return
+
+            if not self.engine.start_ios_gpx_playback(self._ios_gpx_path):
+                self.logMessage.emit(f"⚠️ [{self.label}] iOS 連續播放啟動失敗，改用逐點送座標模式")
+                self._run_timed_android()
+                return
+
+            timeline = gpx_tools.route_step_timeline(remaining, self.speed_kmh)
+            total_duration = timeline[-1][0]
+            route_start = time.time()
+            elapsed = 0.0
+
+            while self._is_patrolling and not self._is_paused:
+                elapsed = time.time() - route_start
+                if elapsed >= total_duration:
+                    self.curr_lat, self.curr_lng = timeline[-1][1], timeline[-1][2]
+                    elapsed = total_duration
+                    break
+
+                lat, lng, local_idx = self._interpolate_timeline(timeline, elapsed)
+                self.curr_lat, self.curr_lng = lat, lng
+
+                remaining_seconds = max(0.0, total_duration - elapsed)
+                h, m, s = int(remaining_seconds) // 3600, (int(remaining_seconds) % 3600) // 60, int(remaining_seconds) % 60
+                self.remainingTimeUpdated.emit(f"{h:02d}時{m:02d}分{s:02d}秒")
+                self.positionUpdated.emit(lat, lng, local_idx, len(timeline))
+
+                time.sleep(0.3)
+
+            self.engine.stop_ios_gpx_playback()
+
+            if not self._is_patrolling:
+                break
+
+            if self._is_paused:
+                resume_index = self._find_resume_step_index(remaining, elapsed)
+                remaining = [gpx_tools.RouteStep(self.curr_lat, self.curr_lng)] + remaining[resume_index + 1:]
+                while self._is_patrolling and self._is_paused:
+                    time.sleep(0.2)
+                continue
+
+            # 正常播完，依 run_mode 決定要不要繼續下一輪
+            if self._handle_timed_completion():
+                remaining = list(self._timed_steps)
+                if remaining:
+                    self.curr_lat, self.curr_lng = remaining[0].lat, remaining[0].lng
+                continue
+
+            remaining = []
+
+        self.engine.stop_ios_gpx_playback()
+        self._is_patrolling = False
+        self.logMessage.emit(f"⏹️ [{self.label}] 巡邏迴圈結束。")
+        self.finished.emit()

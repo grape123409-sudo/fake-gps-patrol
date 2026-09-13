@@ -1,0 +1,13 @@
+name = "group-planting"
+main = "worker.js"
+compatibility_date = "2026-01-01"
+
+[[durable_objects.bindings]]
+name = "GROUP_ROOM"
+class_name = "GroupRoom"
+
+# new_sqlite_classes（而不是 new_classes）：SQLite-backed Durable Object 是目前
+# 唯一能在 Workers 免費方案上使用的型態，用錯的話免費帳號會部署失敗。
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["GroupRoom"]
